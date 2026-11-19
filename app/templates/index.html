@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Keitaro Wrapper — Creator & Editor</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f5f7; padding: 30px; color: #222; }
+        .card { background: #fff; max-width: 850px; margin: 0 auto 24px; padding: 24px; border: 1px solid #ddd; border-radius: 6px; }
+        .card-narrow { max-width: 480px; }
+        h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .row { display: flex; align-items: center; margin-bottom: 14px; position: relative; }
+        .row label { width: 100px; font-size: 14px; color: #333; }
+        .row input, .row select { flex: 1; padding: 8px; border: 1px solid #888; border-radius: 3px; font-size: 14px; }
+        .autocomplete-list {
+            position: absolute; top: 36px; left: 100px; right: 0; background: #fff;
+            border: 1px solid #888; max-height: 190px; overflow-y: auto; z-index: 20; display: none;
+        }
+        .autocomplete-item { padding: 8px; cursor: pointer; font-size: 13px; border-bottom: 1px solid #eee; }
+        .autocomplete-item:hover { background: #e8f0fe; }
+        .btn { padding: 9px 14px; background: #cfe2ff; border: 1px solid #9ec5fe; border-radius: 3px; font-weight: bold; cursor: pointer; font-size: 13px; }
+        .btn:hover { background: #b6d4fe; }
+        .btn-full { width: 100%; font-size: 14px; padding: 10px; }
+        .msg { margin-top: 12px; font-size: 13px; }
+        details { margin-bottom: 14px; font-size: 13px; color: #555; }
+        summary { cursor: pointer; margin-bottom: 8px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; }
+        th { background: #fafafa; }
+        tr.clickable:hover { background: #f1f7ff; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<div class="card card-narrow">
+    <h2>New campaign</h2>
+    <form id="campaignForm">
+        <div class="row">
+            <label>Name</label>
+            <input type="text" id="name" placeholder="test_ivanov_campaign1" required>
+        </div>
+        <div class="row">
+            <label>Geo</label>
+            <input type="text" id="geo" placeholder="MX,AU,RO" required>
+        </div>
+        <div class="row">
+            <label>Offer</label>
+            <input type="text" id="offerSearch" placeholder="поиск по офферам с автокомплитом" autocomplete="off" required>
+            <input type="hidden" id="offerId" required>
+            <div id="offerDropdown" class="autocomplete-list"></div>
+        </div>
+
+        <details>
+            <summary>Домен, группа и источник (по умолчанию из API)</summary>
+            <div class="row"><label>Domain</label><select id="domainId"></select></div>
+            <div class="row"><label>Group</label><select id="groupId"></select></div>
+            <div class="row"><label>Source</label><select id="sourceId"></select></div>
+        </details>
+
+        <button type="submit" class="btn btn-full">Create</button>
+    </form>
+    <div id="statusMsg" class="msg"></div>
+</div>
+
+<div class="card">
+    <h2>Campaign Streams Editor</h2>
+    <div class="row">
+        <label style="width: 110px;">Campaign ID</label>
+        <input type="number" id="editCampaignId" placeholder="Введите ID кампании или выберите в таблице ниже">
+        <button type="button" class="btn" style="margin-left: 8px;" onclick="fetchStreams()">FETCH STREAMS FROM KT</button>
+        <a id="viewInKtLink" href="#" target="_blank" style="margin-left: 8px; padding: 8px 12px; border: 1px solid #888; border-radius: 3px; text-decoration: none; color: #333; font-size: 13px; display: none;">VIEW IN KT ↗</a>
+    </div>
+    <div id="editorMsg" class="msg"></div>
+    <div id="streamsContainer"></div>
+</div>
+
+<div class="card">
+    <h2>История созданных кампаний (кликните по строке для редактирования)</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>ID в Keitaro</th>
+                <th>Название</th>
+                <th>ГЕО</th>
+                <th>Offer ID</th>
+            </tr>
+        </thead>
+        <tbody id="logsTable"></tbody>
+    </table>
+</div>
+<script>
+    let cachedOffers = [];
+    let originalStreams = {};
+    let draftStreams = {};
+
+    async function loadDictionaries() {
+        const res = await fetch('/api/dictionaries');
+        if (!res.ok) return;
+        const data = await res.json();
+        fillSelect('domainId', data.domains || [], 'name');
+        fillSelect('groupId', data.groups || [], 'name');
+        fillSelect('sourceId', data.sources || [], 'name');
+    }
+
+    function fillSelect(id, items, labelKey) {
+        const sel = document.getElementById(id);
+        sel.innerHTML = items.map(i => `<option value="${i.id}">${i.id} - ${i[labelKey]}</option>`).join('');
+    }
+
+    async function ensureOffersLoaded() {
+        if (!cachedOffers.length) {
+            const res = await fetch('/api/offers?q=');
+            if (res.ok) cachedOffers = await res.json();
+        }
+    }
+
+    const offerSearch = document.getElementById('offerSearch');
+    const offerIdInput = document.getElementById('offerId');
+    const dropdown = document.getElementById('offerDropdown');
+    let timer = null;
+
+    offerSearch.addEventListener('input', () => {
+        clearTimeout(timer);
+        offerIdInput.value = '';
+        timer = setTimeout(async () => {
+            const q = offerSearch.value.trim();
+            const res = await fetch(`/api/offers?q=${encodeURIComponent(q)}`);
+            if (!res.ok) return;
+            const offers = await res.json();
+            dropdown.innerHTML = offers.map(o =>
+                `<div class="autocomplete-item" data-id="${o.id}" data-name="${o.name}">[${o.id}] ${o.name}</div>`
+            ).join('');
+            dropdown.style.display = offers.length ? 'block' : 'none';
+        }, 250);
+    });
+
+    dropdown.addEventListener('click', (e) => {
+        if (e.target.classList.contains('autocomplete-item')) {
+            offerIdInput.value = e.target.dataset.id;
+            offerSearch.value = `[${e.target.dataset.id}] ${e.target.dataset.name}`;
+            dropdown.style.display = 'none';
+        }
+    });
+
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.row')) {
+            dropdown.style.display = 'none';
+        }
+    });
+
+    document.getElementById('campaignForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const msg = document.getElementById('statusMsg');
+        if (!offerIdInput.value) {
+            msg.style.color = 'red';
+            msg.textContent = 'Выберите оффер из выпадающего списка!';
+            return;
+        }
+        msg.style.color = '#333';
+        msg.textContent = 'Создание кампании и потоков...';
+
+        const payload = {
+            name: document.getElementById('name').value.trim(),
+            geo: document.getElementById('geo').value.trim(),
+            offer_id: Number(offerIdInput.value),
+            domain_id: Number(document.getElementById('domainId').value) || null,
+            group_id: Number(document.getElementById('groupId').value) || null,
+            traffic_source_id: Number(document.getElementById('sourceId').value) || null,
+        };
+
+        const res = await fetch('/api/campaigns', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+            msg.style.color = 'green';
+            msg.textContent = `Успех! Создана кампания ID: ${data.campaign.id}`;
+            loadLogs();
+            openInEditor(data.campaign.id);
+        } else {
+            msg.style.color = 'red';
+            msg.textContent = `Ошибка: ${JSON.stringify(data.detail)}`;
+        }
+    });
+
+    async function loadLogs() {
+        const res = await fetch('/api/logs');
+        if (!res.ok) return;
+        const logs = await res.json();
+        document.getElementById('logsTable').innerHTML = logs.map(l =>
+            `<tr class="clickable" onclick="openInEditor(${l.keitaro_campaign_id})" title="Нажмите, чтобы открыть потоки кампании">
+                <td><b>${l.keitaro_campaign_id}</b></td>
+                <td>${l.name}</td>
+                <td>${l.geo}</td>
+                <td>${l.offer_id}</td>
+            </tr>`
+        ).join('');
+    }
+
+    function openInEditor(campaignId) {
+        document.getElementById('editCampaignId').value = campaignId;
+        fetchStreams();
+    }
+    function recalculateShares(offers) {
+        const active = offers.filter(o => (o.state || 'active') === 'active');
+        if (!active.length) return;
+
+        let pinnedSum = 0;
+        const unpinned = [];
+
+        active.forEach(o => {
+            if (o.pinned) {
+                o.share = Math.max(0, Math.min(100, Number(o.share) || 0));
+                pinnedSum += o.share;
+            } else {
+                unpinned.push(o);
+            }
+        });
+
+        if (unpinned.length > 0) {
+            const remaining = Math.max(0, 100 - pinnedSum);
+            const base = Math.floor(remaining / unpinned.length);
+            const rem = remaining % unpinned.length;
+
+            unpinned.forEach((o, idx) => {
+                o.share = base + (idx < rem ? 1 : 0);
+            });
+        }
+    }
+
+    async function fetchStreams() {
+        const campaignId = document.getElementById('editCampaignId').value;
+        const msg = document.getElementById('editorMsg');
+        if (!campaignId) return;
+
+        msg.style.color = '#333';
+        msg.textContent = 'Загрузка потоков из Keitaro...';
+        await ensureOffersLoaded();
+
+        const res = await fetch(`/api/campaigns/${campaignId}/streams`);
+        const data = await res.json();
+        if (!res.ok) {
+            msg.style.color = 'red';
+            msg.textContent = `Ошибка: ${JSON.stringify(data.detail)}`;
+            return;
+        }
+
+        msg.textContent = '';
+        const ktLink = document.getElementById('viewInKtLink');
+        ktLink.href = `${data.keitaro_url}/#!/campaign/${campaignId}/main`;
+        ktLink.style.display = 'inline-block';
+
+        originalStreams = {};
+        draftStreams = {};
+        data.streams.forEach(s => {
+    (s.offers || []).forEach(o => {
+        o.pinned = false;
+        if (o.state === 'disabled' || Number(o.share) === 0) {
+            o.state = 'disabled';
+            o.share = 0;
+        } else {
+            o.state = 'active';
+        }
+    });
+    originalStreams[s.id] = JSON.parse(JSON.stringify(s));
+    draftStreams[s.id] = JSON.parse(JSON.stringify(s));
+});
+
+        renderStreams(campaignId);
+    }
+
+    function isStreamDirty(streamId) {
+    const mapOffers = (list) => (list || []).map(o => ({
+        offer_id: o.offer_id,
+        share: o.share,
+        state: o.state || 'active'
+    }));
+    return JSON.stringify(mapOffers(originalStreams[streamId].offers)) !== JSON.stringify(mapOffers(draftStreams[streamId].offers));
+}
+
+    function renderStreams(campaignId) {
+        const container = document.getElementById('streamsContainer');
+        const offersOptions = cachedOffers.map(o => `<option value="${o.id}">[${o.id}] ${o.name}</option>`).join('');
+
+        container.innerHTML = Object.values(draftStreams).map(stream => {
+            const dirty = isStreamDirty(stream.id);
+            const filterText = (stream.filters && stream.filters.length)
+                ? stream.filters.map(f => `${f.name}: ${(f.payload || []).join(',')}`).join('; ')
+                : 'None';
+
+            const offersRows = (stream.offers || []).map(o => {
+    const isDisabled = o.state === 'disabled';
+    return `
+        <tr style="${isDisabled ? 'background: #f8f9fa; color: #adb5bd;' : ''}">
+            <td style="${isDisabled ? 'color: #868e96;' : ''}">
+                <b>${o.offer_id}</b> ${o.offer_name || ''}
+            </td>
+            <td style="white-space: nowrap;">
+                ${isDisabled ? `
+                    <span style="color: #adb5bd; font-weight: bold;">0%</span>
+                    <span style="opacity: 0.25; font-size: 14px;">📌</span>
+                ` : `
+                    ${o.pinned ? `
+                        <input type="number" min="0" max="100" value="${o.share}"
+                            onchange="updatePinnedShare(${campaignId}, ${stream.id}, ${o.offer_id}, this.value)"
+                            style="width: 48px; padding: 2px 4px; font-weight: bold; color: #0d6efd;">%
+                    ` : `
+                        <span style="color: #0d6efd; font-weight: bold;">${o.share}%</span>
+                    `}
+                    <button type="button" onclick="togglePinOffer(${campaignId}, ${stream.id}, ${o.offer_id})"
+                        title="${o.pinned ? 'Открепить долю' : 'Закрепить долю'}"
+                        style="border: none; background: transparent; cursor: pointer; font-size: 14px; opacity: ${o.pinned ? '1' : '0.35'};">📌</button>
+                `}
+            </td>
+            <td style="color: #868e96;">clicks: ${o.clicks ?? 0}</td>
+            <td style="color: #868e96;">—</td>
+            <td style="text-align: right;">
+                ${isDisabled ? `
+                    <button type="button" onclick="localBringBackOffer(${campaignId}, ${stream.id}, ${o.offer_id})"
+                        style="cursor:pointer; padding: 4px 8px; background: #fff; border: 1px solid #adb5bd; border-radius: 3px; font-weight: bold; color: #333;">↺ BRING BACK</button>
+                ` : `
+                    <button type="button" onclick="localRemoveOffer(${campaignId}, ${stream.id}, ${o.offer_id})"
+                        style="cursor:pointer; padding: 4px 8px;">🗑 REMOVE</button>
+                `}
+            </td>
+        </tr>
+    `;
+}).join('');
+
+            const isOfferStream = stream.schema === 'landings' || (stream.offers && stream.offers.length > 0);
+
+            return `
+                <div style="border: 1px solid #ccc; margin-top: 16px; border-radius: 4px; overflow: hidden;">
+                    <div style="background: ${dirty ? '#fff9db' : '#f1f3f5'}; padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #ccc;">
+                        <div>
+                            <b>Stream: ${stream.name} (#${stream.position})</b>
+                            <span style="color: #666;">filter by ${filterText}, stream_id ${stream.id}, clicks today: ${stream.clicks ?? 0}</span>
+                        </div>
+                        ${dirty ? `
+                            <div style="margin-top: 8px; display: flex; gap: 8px;">
+                                <button type="button" onclick="pushStreamToKt(${campaignId}, ${stream.id})" style="background: #228be6; color: #fff; border: none; padding: 6px 12px; font-weight: bold; border-radius: 3px; cursor: pointer;">⬆ PUSH TO KT</button>
+                                <button type="button" onclick="cancelStreamChanges(${campaignId}, ${stream.id})" style="background: #fff; color: #333; border: 1px solid #adb5bd; padding: 6px 12px; font-weight: bold; border-radius: 3px; cursor: pointer;">✕ CANCEL</button>
+                            </div>
+                        ` : ''}
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Offer</th>
+                                <th style="width: 70px;">Share</th>
+                                <th style="width: 110px;">Stats</th>
+                                <th style="width: 90px;">Trends</th>
+                                <th style="width: 110px; text-align: right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${offersRows || '<tr><td colspan="5" style="color:#777;">Нет привязанных офферов (редирект/действие)</td></tr>'}
+                        </tbody>
+                    </table>
+                    ${isOfferStream ? `
+                        <div style="padding: 8px 12px; background: #fafafa; border-top: 1px solid #eee; display: flex; gap: 8px;">
+                            <select id="addSelect_${stream.id}" style="flex: 1; padding: 6px;">${offersOptions}</select>
+                            <button type="button" onclick="localAddOffer(${campaignId}, ${stream.id})" style="padding: 6px 14px; font-weight: bold; cursor: pointer;">ADD</button>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        }).join('');
+    }
+
+    function localRemoveOffer(campaignId, streamId, offerId) {
+    const stream = draftStreams[streamId];
+    const offer = (stream.offers || []).find(o => o.offer_id === offerId);
+    if (!offer) return;
+
+    offer.state = 'disabled';
+    offer.share = 0;
+    offer.pinned = false;
+
+    recalculateShares(stream.offers);
+    renderStreams(campaignId);
+}
+
+function localBringBackOffer(campaignId, streamId, offerId) {
+    const stream = draftStreams[streamId];
+    const offer = (stream.offers || []).find(o => o.offer_id === offerId);
+    if (!offer) return;
+
+    offer.state = 'active';
+    offer.pinned = false;
+
+    recalculateShares(stream.offers);
+    renderStreams(campaignId);
+}
+
+function localAddOffer(campaignId, streamId) {
+    const select = document.getElementById(`addSelect_${streamId}`);
+    const offerId = Number(select.value);
+    const offerObj = cachedOffers.find(o => o.id === offerId);
+    const stream = draftStreams[streamId];
+
+    if (!stream.offers) stream.offers = [];
+    const existing = stream.offers.find(o => o.offer_id === offerId);
+
+    if (existing) {
+        if (existing.state === 'disabled') {
+            existing.state = 'active';
+            existing.pinned = false;
+            recalculateShares(stream.offers);
+            renderStreams(campaignId);
+            return;
+        }
+        alert('Этот оффер уже активен в потоке');
+        return;
+    }
+
+    stream.offers.push({
+        offer_id: offerId,
+        offer_name: offerObj ? offerObj.name : `Offer #${offerId}`,
+        share: 0,
+        state: 'active',
+        pinned: false
+    });
+    recalculateShares(stream.offers);
+    renderStreams(campaignId);
+}
+
+    function cancelStreamChanges(campaignId, streamId) {
+        draftStreams[streamId] = JSON.parse(JSON.stringify(originalStreams[streamId]));
+        renderStreams(campaignId);
+    }
+
+    async function pushStreamToKt(campaignId, streamId) {
+    const msg = document.getElementById('editorMsg');
+    const allOffers = draftStreams[streamId].offers || [];
+    const activeOffers = allOffers.filter(o => o.state !== 'disabled');
+    const totalShare = activeOffers.reduce((sum, o) => sum + (Number(o.share) || 0), 0);
+
+    if (activeOffers.length > 0 && totalShare !== 100) {
+        msg.style.color = 'red';
+        msg.textContent = `Сумма долей активных офферов должна равняться 100% (сейчас ${totalShare}%)`;
+        return;
+    }
+
+    msg.style.color = '#333';
+    msg.textContent = 'Отправка изменений в Keitaro...';
+
+    try {
+        const res = await fetch(`/api/campaigns/${campaignId}/streams/${streamId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ offers: allOffers })
+        });
+
+        if (res.ok) {
+            msg.style.color = 'green';
+            msg.textContent = 'Изменения успешно сохранены в Keitaro!';
+            await fetchStreams();
+        } else {
+            const err = await res.json();
+            msg.style.color = 'red';
+            msg.textContent = `Ошибка при сохранении: ${JSON.stringify(err.detail)}`;
+        }
+    } catch (e) {
+        msg.style.color = 'red';
+        msg.textContent = `Сетевая ошибка: ${e.message}`;
+    }
+}
+
+    function togglePinOffer(campaignId, streamId, offerId) {
+    const stream = draftStreams[streamId];
+    const offer = (stream.offers || []).find(o => o.offer_id === offerId);
+    if (!offer) return;
+    offer.pinned = !offer.pinned;
+    recalculateShares(stream.offers);
+    renderStreams(campaignId);
+}
+
+function updatePinnedShare(campaignId, streamId, offerId, newValue) {
+    const stream = draftStreams[streamId];
+    const offer = (stream.offers || []).find(o => o.offer_id === offerId);
+    if (!offer) return;
+    offer.share = Math.max(0, Math.min(100, Number(newValue) || 0));
+    recalculateShares(stream.offers);
+    renderStreams(campaignId);
+}
+
+    loadDictionaries();
+    loadLogs();
+</script>
+</body>
+</html>
